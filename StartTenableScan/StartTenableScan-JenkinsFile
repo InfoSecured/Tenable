@@ -1,0 +1,316 @@
+node('domo')
+{
+	try
+	{
+	    stage('RunPowerShell')
+		{
+			powershell '''
+			$hosts = $env:Hosts
+			$scanName = $env:CaseNumber
+			$username = $env:Username.ToLower()
+			$password = $env:Password
+			$scanType = $env:ScanType
+			$reportDict = Invoke-Expression $env:reportDict
+			$hostname = $env:server
+			
+			add-type @"
+				using System.Net;
+				using System.Security.Cryptography.X509Certificates;
+				public class TrustAllCertsPolicy : ICertificatePolicy {
+					public bool CheckValidationResult(
+						ServicePoint srvPoint, X509Certificate certificate,
+						WebRequest request, int certificateProblem) {
+						return true;
+					}
+				}
+"@
+
+			[System.Net.ServicePointManager]::CertificatePolicy = New-Object TrustAllCertsPolicy
+						
+			#Ignore self signed certificates
+			[System.Net.ServicePointManager]::ServerCertificateValidationCallback = $null
+						
+			# Build credentials object
+			$LoginData = (ConvertTo-Json -compress @{username=$username; password=$password})
+						
+			#----------------------------------
+			# Get Token
+			#----------------------------------
+						
+			# Login to Tenable
+			try{
+				$ret = Invoke-WebRequest -URI $hostname/token -Method POST  -Body $LoginData -UseBasicParsing -SessionVariable sv -ErrorAction Stop
+			}
+			catch [System.Net.WebException] {
+				$failMessage = ($_.Exception.Message).ToString().Trim();
+				Write-Output $failMessage;
+				If ($failMessage.Contains('404')) { 
+					Write-Output "Host not found. Exiting." 
+					write-host $error[0]
+					throw $LASTEXITCODE
+				}
+				ElseIf ($failMessage.Contains('403')) { 
+					Write-Output "Invalid Login Credentials. Exiting." 
+					write-host $error[0]
+					throw $LASTEXITCODE
+				}
+				Exit
+			}
+						
+			# Extract the token
+			$loginToken = (ConvertFrom-json $ret.Content).response.token
+						
+			#----------------------------------
+			# Determine User for Report E-Mail
+			#----------------------------------
+						
+			$reportID = $reportDict[$($username)];
+						
+			#----------------------------------
+			# Clean Host List
+			#----------------------------------
+						
+			$hosts = $hosts -replace " ", ","
+			$hosts = $hosts -replace ",,", ","
+						
+			#----------------------------------
+			# Determine Scan Type
+			#----------------------------------
+						
+						
+			if ($scanType -eq "Patch Scan") {
+				$scanPolicy = "1000007"
+			}
+			elseif ($scanType -eq "New Device Scan") {
+				$scanPolicy = "1000018"
+			}
+			elseif ($scanType -eq "Fast Validation Scan") {
+				$scanPolicy = "1000103"
+			}
+						
+			#----------------------------------
+			# Build Scan
+			#----------------------------------
+						
+			$credentials = (@{"id"=1000002},
+				@{"id"=1000003},
+				@{"id"=1000004},
+				@{"id"=1000006},
+				@{"id"=1000009},
+				@{"id"=1000011},
+				@{"id"=1000012},
+				@{"id"=1000013},
+				@{"id"=1000014},
+				@{"id"=1000015},
+				@{"id"=1000016},
+				@{"id"=1000020},
+				@{"id"=1000019}
+			)
+						
+			$NewScan = (ConvertTo-Json -compress @{
+				"name"="$($scanType): " + $scanName;
+				"description"="";
+				"context"="";
+				"status"=-1;
+				"createdTime"=0;
+				"modifiedTime"=0;
+				"repository"=@{"id"=2};
+				"schedule"=@{"type"="now"};
+				"dhcpTracking"="true";
+				"emailOnLaunch"="true";
+				"emailOnFinish"="true";
+				"reports"=@(@{"id"=$reportId;"reportSource"="individual"});
+				"type"="policy";
+				"policy"=@{"id"=$scanPolicy};
+				"zone"=@{"id"=-1};
+				"timeoutAction"="rollover";
+				"ipList"=$hosts;        
+				"credentials"=$credentials;
+				"maxScanTime"="unlimited";
+				}
+			)
+						
+			#----------------------------------
+			# Start Scan
+			#----------------------------------
+			Write-Host "The report ID is $reportID"
+			Write-Host "The hosts scanned is/are $hosts"
+						
+			try
+			{
+				$ret = Invoke-WebRequest -URI "$($hostname)/scan" -Method Post -Body $NewScan -Headers @{"X-SecurityCenter"=$($loginToken); "Content-Type"="application/json"} -Websession $sv -ErrorAction Stop
+				#Write-Host "Scan Started. A 'Finished: SUCCESS' message below means that the scan was successfully sent to Tenable. Tenable will send you a separate email when the scan completes."
+				$newScanID = (ConvertFrom-Json $ret.Content).response.scanResultID
+				Start-Sleep -Seconds 10
+			}
+			catch [System.Net.WebException] {
+				$failMessage = ($_.Exception.Message).ToString().Trim();
+				Write-Output $failMessage;
+				If ($failMessage.Contains('404')) { 
+					Write-Output "Host not found. Exiting." 
+					write-host $error[0]
+					throw $LASTEXITCODE
+				}
+				ElseIf ($failMessage.Contains('403')) { 
+					Write-Output "An error occurred. Exiting." 
+					write-host $error[0]
+					throw $LASTEXITCODE
+				}
+				Exit
+			}
+
+			#----------------------------------
+			# Check Scan Status
+			#----------------------------------
+
+			$statusURL = "$($hostname)/scanResult/$($newScanID)"
+
+			Write-Host "Checking on your scan..."
+			DO
+			{
+				try
+				{
+					$checkup = Invoke-WebRequest -URI $statusURL -Method Get -Headers @{"X-SecurityCenter"="$($loginToken)"; "Content-Type"="application/json"} -UseBasicParsing -WebSession $sv -ErrorAction Stop 
+					$scanStatus = (ConvertFrom-Json $checkup.Content).response.status
+					Write-Host "Status: $($scanStatus)"
+					Start-Sleep -Seconds 60
+				}
+				catch [System.Net.WebException] {
+					$failMessage = ($_.Exception.Message).ToString().Trim();
+					Write-Output $failMessage;
+					If ($failMessage.Contains('404')) { 
+						Write-Output "Host not found. Exiting." 
+						write-host $error[0]
+						throw $LASTEXITCODE
+					}
+					ElseIf ($failMessage.Contains('403')) { 
+						Write-Output "An error occurred. Exiting." 
+						write-host $error[0]
+						throw $LASTEXITCODE
+					}
+					Exit
+				}
+
+			} While ($scanStatus -ne "Completed");
+
+			Write-Host "Getting Scan Summary Results.`n"
+			Start-Sleep -Seconds 30
+
+			#----------------------------------
+			# Get Scan Results
+			#----------------------------------
+
+			$query = (ConvertTo-Json -Compress @{
+			"query"= @{"id"= 1};
+			"sourceType"= "individual";
+			"scanID"= "$($newScanID)";
+			"sortField"= "severity";
+			"sortDir"= "desc";
+			"startOffset"= '0';
+			"endOffset"= '5';
+			"type"= "vuln";
+			"view"= "all";
+			}
+			)
+
+			try
+			{
+				$ret = Invoke-WebRequest -URI "$($hostname)/analysis" -Method Post -Body $query -Headers @{"X-SecurityCenter"="$($loginToken)"; "Content-Type"="application/json"} -UseBasicParsing -WebSession $sv -ErrorAction Stop
+				$totalRecords = (ConvertFrom-Json $ret.Content).response | Select -ExpandProperty results
+				$array = @($totalRecords)
+
+			}
+			catch [System.Net.WebException] {
+				$failMessage = ($_.Exception.Message).ToString().Trim();
+				Write-Output $failMessage;
+				If ($failMessage.Contains('404')) { 
+					Write-Output "Host not found. Exiting." 
+					write-host $error[0]
+					throw $LASTEXITCODE
+				}
+				ElseIf ($failMessage.Contains('403')) { 
+					Write-Output "An error occurred. Exiting." 
+					write-host $error[0]
+					throw $LASTEXITCODE
+				}
+				Exit
+			}
+
+			#----------------------------------
+			# Parse Summary Results
+			#----------------------------------
+			foreach($result in $array) {
+				$ip = $result.ip
+				$high = $result.severityHigh
+				$critical = $result.severityCritical
+				$netbios = $result.netbiosName
+				$dns = $result.dnsName
+				$lastauthrun = $result.lastAuthRun
+				$lastunauthrun = $result.lastUnauthRun
+				Write-Host "IP Address: $($ip)"
+				if (!$netbios) {
+					Write-Host "Computer Name: $($dns)"
+					$computerName = $dns
+				}
+				else {
+					Write-Host "Computer Name: $($netbios)"
+					$computerName = $netbios.Replace('\\','\\\\')
+				}
+				Write-Host "High Vulnerabilities: $($high)"
+				Write-Host "Critical Vulnerabilities: $($critical)"
+				if (!$lastauthrun) {
+						Write-Host "Last scan was unauthenticated.`n"
+						$authenticated = "False"
+				}
+				else {
+					Write-Host "Last scan authenticated successfully.`n"
+						$authenticated = "True"
+				}
+				$completedResult = "IP Address: {0}\n{1}\nCritical Vulnerabilities: {2}\nHigh Vulnerabilities:{3}\nAuthenticated: $authenticated\n\n" -f $ip,$computerName,$critical,$high
+				
+				$attachments=@"
+				{
+					"text": "Vulnerability Summary Results",
+					"attachments": [
+						{
+							"fallback": "Tenable",
+							"author_name": "Owner: $username",
+							"title": "$scanName",
+							"text": "$completedResult",
+							"actions": [
+								{
+									"name": "action",
+									"type": "button",
+									"text": "View in Tenable",
+									"style": "primary",
+									"value": "", # INSERT TENABLE HOSTNAME (NOT URL)
+									"style": "primary",
+									"url": "https://{INSERT TENABLE URL HERE}/#scan_results"
+								}
+							]
+						}
+					]
+				}
+"@
+
+				$response = Invoke-WebRequest -URI "INSERT SLACK HOOK URL" -Method Post -Headers @{"Content-Type"="application/json; charset=utf-8"} -Body $attachments -UseBasicParsing
+
+			}
+						
+			#----------------------------------
+			# Cleanup Tasks
+			#----------------------------------
+						
+			#Destroy the token
+			$ret = Invoke-WebRequest -URI $hostname/token -method Delete -UseBasicParsing -Headers @{"X-SecurityCenter"="$loginToken"} -Websession $sv
+			
+            '''
+
+		}
+	}
+	catch (Exception exception)
+	{
+		currentBuild.result = 'FAILURE'
+		echo exception.message
+	}
+}
